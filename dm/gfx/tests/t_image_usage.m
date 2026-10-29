@@ -75,8 +75,37 @@ static void image_case(int explicit_image) { @autoreleasepool {
     read_level(tex_mtl(&alias), 1, pixels); same = 1; for (int i = 0; i < 16; i++) same &= pixels[i] == (i == 5 ? 0x3400 : 0x3a00);
     CHECK(same, "sampled alias sees the image write and untouched pixels");
 } }
+static void sampled_case(void) { @autoreleasepool {
+    tex_t texture = {.magic=MAGIC('T','E','X',0), .serial=99601};
+    texture.d = (nvn_texdesc){.target=NVN_TEXTURE_TARGET_2D, .format=NVN_FORMAT_R16F,
+        .flags=NVN_TEXTURE_FLAGS_COMPRESSIBLE, .width=8, .height=8, .depth=1, .levels=1, .samples=1};
+    nvn_tex_layout(&texture.d, &texture.L); mtl_tex_init(&texture);
+    id<MTLTexture> old = tex_mtl(&texture);
+    CHECK(old && !(old.usage & MTLTextureUsagePixelFormatView), "sampled case starts without format-view usage");
+    mtl_sub_begin(); memset(&R, 0, sizeof R); R.has_rt=1; R.rt.n=1; R.rt.color[0]=&texture;
+    R.clear_c[0]=1; R.cc[0]=MTLClearColorMake(0.5,0,0,1);
+    CHECK(rp_begin() != nil, "clear pass opens before sampled view registration");
+    view_t view = {.set_format=1, .format=NVN_FORMAT_R16UI};
+    mtl_reg_tex(603, &texture, &view);
+    NvProg *program=[NvProg new]; NvShader *shader=[NvShader new]; program->sh[1]=shader;
+    shader->rf.nb=1; shader->rf.b[0]=(nvn_rbind){.kind=NVN_RB_TEX,.reg=0}; S.tex[1][0]=603;
+    sampled_prepare(program, 1u << 1);
+    CHECK(!g_enc, "format upgrade closes the old pass during preparation");
+    id<MTLTexture> upgraded=tex_mtl(&texture);
+    CHECK(upgraded != old && (upgraded.usage & MTLTextureUsagePixelFormatView), "sampled format upgrade replaces backing before the draw");
+    id<MTL4RenderCommandEncoder> next=rp_begin();
+    os_unfair_lock_lock(&g_rmu); id<MTLTexture> sampled=tex_by_id(603); os_unfair_lock_unlock(&g_rmu);
+    CHECK(sampled.pixelFormat == MTLPixelFormatR16Uint, "binding resolves the requested integer view");
+    CHECK(g_enc == next && next != nil, "argument lookup keeps the draw encoder alive");
+    sampled_prepare(program, 1u << 1);
+    CHECK(g_enc == next, "reusing a prepared view does not split its render pass");
+    mtl_sub_commit(); mtl_drain();
+    uint16_t pixels[64]; read_level(upgraded,0,pixels);
+    int same=1; for(int i=0;i<64;i++) same &= pixels[i]==0x3800;
+    CHECK(same, "sampled format upgrade preserves the old pass's clear");
+} }
 int main(void) { @autoreleasepool {
-    mtl_init(); image_case(0); image_case(1);
+    mtl_init(); image_case(0); image_case(1); sampled_case();
     printf("explicit image usage: %d checks, %d failed\n", checks, failed);
     return failed != 0;
 } }

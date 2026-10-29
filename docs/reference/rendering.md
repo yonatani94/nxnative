@@ -541,6 +541,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - Instanced array draws (`DrawArraysInstanced`) carry instance count and base instance in the `OP_DRAW` record.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md).
 
+### Sampled format upgrades before encoder creation
+
+- **Symptom:** a crash in Metal 4's `drawIndexedPrimitives`, immediately after `texture upgraded to allow format views`; the draw's index address is mapped.
+- **Cause:** resolving a sampled integer/unorm format view in `encode_args` calls `tex_upgrade_pfv`. Its preservation copy closes the render encoder, but the draw still holds and uses that ended encoder.
+- **Fix:** `sampled_prepare` resolves format-view usage requirements before the draw or dispatch opens its encoder, including geometry and direct, uniform-buffer and dynamic texture handles. Ordinary same-format bindings do not upgrade storage. Argument lookup then uses the prepared backing without closing the draw's encoder.
+- **Found on:** Need for Speed Hot Pursuit Remastered, update 1.0.3, provisional local profile: its 4096x1024 integer UI atlas is sampled through an unorm view. `t_image_usage` checks the format replacement, preserved clear, integer view, live subsequent encoder and repeated preparation under Metal API validation (53 checks total). A 55-second Mac boot under validation passed 1,200 frames, showed the startup logos and had no missing-shader errors or crash. Gameplay remains unverified. Existing view-level and swizzle tests passed 45 and 203 checks respectively.
+
 ### 8-bit index buffers
 
 - **Cause:** Metal has only 16/32-bit indices.

@@ -6460,6 +6460,49 @@ static uint32_t ubo_handle(int stage, int reg, int off) { uint32_t h; ubo_read(s
 // A handle read from a uniform buffer names IDs of the pools bound when the draw runs: as bound handles are moved at recording (hle_nvn.c bind_handles), these take the bases here (0 = none)
 static int ubo_tex_id(uint32_t h) { int t = (int)(h & 0xfffff); return t ? t + S.tex_base : 0; }
 static int ubo_samp_id(uint32_t h) { int s = (int)(h >> 20); return s ? s + S.samp_base : 0; }
+// A sampled format view can replace its backing and encode a copy. Do that before
+// opening the draw/dispatch encoder: tex_by_id inside encode_args must not end
+// the encoder that the draw is about to use (Criterion's integer UI atlas views).
+static void sampled_view_prepare(int tid) {
+    if (tid <= 0) return;
+    os_unfair_lock_lock(&g_rmu);
+    if (tid < g_ntreg && g_treg[tid].ok && g_treg[tid].has_v && g_treg[tid].v.set_format) {
+        treg_t *r = &g_treg[tid]; uint32_t pf = 0; uint8_t sw[4];
+        if (nvn_fmt_to_mtl(r->v.format, &pf, sw) && pf) {
+            id<MTLTexture> base = tex_mtl(&r->t);
+            if (base && tex_need_pfv(base.pixelFormat, (MTLPixelFormat)pf) && !(base.usage & MTLTextureUsagePixelFormatView)) {
+                tex_upgrade_pfv(&r->t, base, (MTLPixelFormat)pf);
+                args_dirty_all();
+            }
+        }
+    }
+    os_unfair_lock_unlock(&g_rmu);
+}
+static void sampled_prepare(NvProg *pr, unsigned stages) {
+    if (!pr) return;
+    for (int st = 0; st < 6; st++) {
+        if (!(stages & (1u << st)) || !pr->sh[st]) continue;
+        NvShader *sh = pr->sh[st];
+        for (int i = 0; i < sh->rf.nb; i++) {
+            const nvn_rbind *b = &sh->rf.b[i];
+            switch (b->kind) {
+                case NVN_RB_TEX: case NVN_RB_TBUF:
+                    sampled_view_prepare((int)(tex_slot_h(S.tex[st], S.img[st], b->reg) & 0xfffff)); break;
+                case NVN_RB_IMG:
+                    if (b->reg < 32) sampled_view_prepare((int)(S.img[st][b->reg] & 0xfffff)); break;
+                case NVN_RB_TEXU:
+                    for (int k = 0; k < (b->n ? b->n : 1); k++) sampled_view_prepare(ubo_tex_id(ubo_handle(st, b->reg, b->n ? 8 * k : b->off)));
+                    break;
+                case NVN_RB_TEXA:
+                    for (int k = 0; k < b->n; k++) sampled_view_prepare((int)(c2_handle(st, b->off + 8u * k) & 0xfffff));
+                    break;
+                case NVN_RB_TEXD:
+                    for (int k = 0; k < b->n && k < 128; k++) sampled_view_prepare((int)((S.tex[st][k] ? S.tex[st][k] : S.tex[st][NVN_SEPTEX_SLOT0 + k]) & 0xfffff));
+                    break;
+            }
+        }
+    }
+}
 static uint32_t g_dispatch_dim[3];   // the current dispatch's workgroup counts (driver segment c0 + 0x200 for compute)
 static uint32_t g_draw_binst;   // the current draw's base instance (draw), for c0 + 0x644
 static __unsafe_unretained id<MTLBuffer> g_c0_dim_buf; static size_t g_c0_dim_off;   // where encode_args put them for this dispatch (nil: the shader reads no c0); an indirect dispatch copies its GPU-written counts there
@@ -8860,6 +8903,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
         NvProg *geometry_program = prog_get(S.prog);
         if (geometry_program && geometry_program->sh[2] && geometry_program->sh[2]->geo_vertices) {
             if ((dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i)) || (di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i))) return;
+            sampled_prepare(geometry_program, (1u << 0) | (1u << 2));
             image_prepare(geometry_program, (1u << 0) | (1u << 2));
             geo_draw(geometry_program, dw, di, 0); return;
         }
@@ -8871,6 +8915,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     g_mdxc.next = NULL;
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
+    sampled_prepare(pr, 0x1f);
     image_prepare(pr, 0x1f);
     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
     if (!g_geo_program && S.rast_discard && S.tf_on) { tf_draw(pr, dw, di); return; }
@@ -9255,6 +9300,7 @@ static void dispatch(const p_dispatch *dp) {
     if (!tg[0]) { RED_ONCE(29, "compute shader lacks threadgroup size reflection"); return; }
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
     rp_end();
+    sampled_prepare(prog_get(S.cprog), 0x20);
     image_prepare(prog_get(S.cprog), 0x20);
     int own = dispatch_own();
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }

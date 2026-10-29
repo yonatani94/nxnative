@@ -2046,6 +2046,43 @@ def unity_text_glslc(x, base):
 
 NEST = 16   # archives in archives scan_blob opens (SARC, PlatinumGames' DAT): real files nest a few. A damaged or crafted one could nest one per header's length, or have every
             # member point at the same inner archive, its work doubling with each level: the members a file's archives open may add up to at most NEST times the file
+def bnd2_shaders(d, label):
+    """Criterion bnd2 v3's ShaderProgramBuffer resources (type 8).
+    Four independently stored streams per 0x50-byte resource; sizes carry an
+    alignment nibble. NVN GLSLC outputs are in the compressed second stream,
+    rather than loose in the bundle (Need for Speed Hot Pursuit Remastered).
+    Read the resource table, not arbitrary zlib-looking bytes in other assets.
+    """
+    if len(d) < 0x30: red(f'{label}: truncated bnd2 header')
+    version, platform, _, count, table = struct.unpack_from('<5I', d, 4)
+    if version != 3 or platform != 1: red(f'{label}: unsupported bnd2 version/platform {version}/{platform}')
+    bases = struct.unpack_from('<4I', d, 0x18)
+    flags = struct.unpack_from('<I', d, 0x28)[0]
+    if table < 0x30 or table > len(d) or count > (len(d) - table) // 0x50 or any(b > len(d) for b in bases):
+        red(f'{label}: invalid bnd2 resource table or stream offsets')
+    out = []
+    for i in range(count):
+        entry = table + i * 0x50
+        if struct.unpack_from('<I', d, entry + 0x44)[0] != 8: continue
+        if flags not in (8, 9, 0x19): red(f'{label}: unsupported bnd2 shader compression flags {flags:#x}')
+        for j in range(4):
+            raw = struct.unpack_from('<I', d, entry + 0x10 + 4 * j)[0] & 0x0fffffff
+            if not raw: continue
+            stored = struct.unpack_from('<I', d, entry + 0x20 + 4 * j)[0] & 0x0fffffff
+            start = bases[j] + struct.unpack_from('<I', d, entry + 0x30 + 4 * j)[0]
+            size = stored if flags & 1 else raw
+            where = f'{label}#bnd2:{i}:{j}'
+            if size > len(d) or start > len(d) - size or raw > 64 * 1024 * 1024:
+                red(f'{where}: shader stream outside bundle or above 64 MiB')
+            blob = d[start:start + size]
+            if flags & 1:
+                dec = zlib.decompressobj()
+                blob = dec.decompress(blob, raw + 1)
+                if len(blob) != raw or not dec.eof: red(f'{where}: incomplete shader stream or wrong decompressed length')
+            out.extend(glslc_shaders(blob, where, need=False))
+    return out
+
+
 def scan_blob(d, label, out, depth=0, left=None):
     if depth > NEST: red(f'{label}: archives nested more than {NEST} deep')
     if d[:4] in (b'HCPS', b'xbc1', b'DRSM') or d[:8] == b'cmp\0zlib':
@@ -2163,6 +2200,9 @@ def scan_file_in(args):
     if ext in ('.data', '.patch', '.debug', '.nxpc') and os.path.exists(stem + '.dict'): return rel, {}, set(), {}   # read through its Next Level Games index (nlg_shaders)
     with open(path, 'rb') as f: head = f.read(16)
     found = []; trees = {}
+    if head[:4] == b'bnd2':
+        found += bnd2_shaders(open(path, 'rb').read(), '/' + rel)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == b'ARH1':
         arh_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees

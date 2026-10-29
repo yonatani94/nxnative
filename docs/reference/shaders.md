@@ -211,6 +211,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Pokémon Sword](../../dm/games/0100ABF008968000/README.md): after the [GFPAK reader](#bnsh-entries-of-gfpak-archives), 38 shaders the opening drew were still missing; none was a patched copy of a split shader (the nearest ones of the same length differ in hundreds of bytes). `main` imports `glslcCompile` from `subsdk1` but never calls it and holds no GLSL source. The only zlib stream in `main` that inflates (`main+0x1c98ed9`, 39.5 MB) holds 3,155 shaders (3,015 distinct, 3,112 pixel and 43 vertex); they covered all 38.
 - **Check:** a temporary trace in `nvnProgramSetShaders` (the key's code and control addresses, a backtrace and the heap around them) showed control sections packed back to back with technique names such as `ps_BrightPassT1_THRESHOLD_LUMINANCE_S1` beside them; the names are in `main`, and so is the data.
 
+### GLSLC outputs in Criterion bnd2 shader resources
+
+- **Symptom:** the game boots with audio but a black or incomplete picture; the split finds only the executable's shaders, and the runtime reports `shader ... is not in the shader map` and `program has no vertex shader`.
+- **Cause:** Criterion's version-3, little-endian `bnd2` bundles store GLSLC outputs in compressed ShaderProgramBuffer resources (type 8). The file itself contains no uncompressed GLSLC magic, so the loose-file prefilter missed them.
+- **Fix:** `shader_split.py` `bnd2_shaders` reads the resource count and table at header +0x10/+0x14, four stream bases at +0x18, and the 0x50-byte resource records. Each has four uncompressed sizes at +0x10, stored sizes at +0x20, stream-relative offsets at +0x30 and resource type at +0x44. Sizes carry an alignment nibble. Flags 9 and 0x19 use zlib; flag 8 is uncompressed. Only shader resources are inflated, with range, output-size and complete-stream checks; their GLSLC outputs go through the existing stage reader and single-stage pairing.
+- **Found on:** Need for Speed Hot Pursuit Remastered, title `010029B0118E8000`, update 1.0.3 (provisional local profile). All six missing shader keys captured during boot matched GLSLC outputs in `SHADERS.BNDL`. Synthetic tests cover the second stream, alignment bits, uncompressed data, truncated tables, invalid offsets and bounded inflation. Gameplay validation remains open.
+
 ### Loose control sections and code areas in main (Bink 2)
 
 - **Symptom:** two `[RED] shader … is not in the shader map` lines and `program has no vertex shader` as the opening movie starts; every movie drew white.
